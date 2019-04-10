@@ -9,6 +9,7 @@ from PIL import Image
 from PIL import ImageDraw
 from PIL import ImageFont
 import utils
+import math
 
 
 EP_MAX = 20000
@@ -19,7 +20,7 @@ UPDATE_STEP = 5             # loop update operation n-steps
 n_model = 1
 S_DIM = 64 * 64
 A_DIM = 3
-A_BOUND = [50, 50, 50]
+A_BOUND = [25, 25, 25]
 width = 64
 height = 64
 count = 0
@@ -29,7 +30,6 @@ class ppo_agent():
     def __init__(self, ckpt_dir='./ckpt', sum_dir='./summaries',
                  epsilon=0.2, A_LR=0.0001, C_LR=0.0005, D_LR=0.0002):
         self.ckpt_dir = ckpt_dir
-        self.replay = []
         self.EPSILON = epsilon  # Clipped surrogate objective
         self.A_LR = A_LR  # learning rate for actor
         self.C_LR = C_LR  # learning rate for critic
@@ -47,19 +47,18 @@ class ppo_agent():
         # actor
         self.ls, pi, pi_params = self._build_policy('pi', trainable=True)
         oldls, oldpi, oldpi_params = self._build_policy('oldpi', trainable=False)
-        self.type = tf.argmax(pi[0], 1)
-        self.sample_op = tf.concat([tf.expand_dims(self.type, axis=-1),
-                                    tf.squeeze(tf.cast(pi[1].sample(1), tf.int64), axis=0)], axis=1)  # choosing action
+        self.type = tf.cast(tf.multinomial(pi[0], 1), tf.float32)
+        self.sample_op = tf.concat([self.type,
+                                    tf.squeeze(pi[1].sample(1), axis=0)], axis=1)  # choosing act
         self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
 
-        ratio = tf.concat([pi[1].prob(self.ph_a[:, 1:4]) / (oldpi[1].prob(self.ph_a[:, 1:4]) + 1e-5),
-                          pi[0] / oldpi[0]], axis=1)
+        ratio = tf.concat([(pi[0] + 1e-5) / (oldpi[0] + 1e-3),
+                           pi[1].prob(self.ph_a[:, 1:4]) / (oldpi[1].prob(self.ph_a[:, 1:4]) + 1e-5)], axis=1)
         surr = ratio * self.ph_adv   # surrogate loss
 
         self.aloss = -tf.reduce_mean(tf.minimum(surr,
             tf.clip_by_value(ratio, 1. - self.EPSILON, 1. + self.EPSILON) * self.ph_adv))
         self.atrain_op = tf.train.AdamOptimizer(A_LR).minimize(self.aloss)
-
 
         # number and cmd
         self.nloss = tf.reduce_mean(tf.square((self.num - self.ph_num) / (self.ph_num + 1e5)))
@@ -135,13 +134,17 @@ class ppo_agent():
                 fl1 = tf.layers.flatten(cnn3, name='fl1')
 
             with tf.variable_scope('cmd'):
-                dn1 = tf.layers.dense(fl1, 128, activation=tf.nn.relu,
+                dn1 = tf.layers.dense(tf.concat([fl1, self.ph_ls], axis=1), 128,
+                                      activation=tf.nn.leaky_relu,
+                                      trainable=trainable, name='add1')
+                dn1 = tf.layers.dense(dn1, 128, activation=tf.nn.sigmoid,
                                       trainable=trainable, name='dn1')
-                dn1 += self.ph_ls
                 dn2 = tf.layers.dense(dn1, 35, activation=tf.nn.softmax,
                                       trainable=trainable, name='dn2')
-                mu = A_BOUND * tf.layers.dense(dn1, A_DIM, tf.nn.sigmoid, trainable=trainable, name='mu')
-                sigma = tf.layers.dense(dn1, A_DIM, tf.nn.softplus, trainable=trainable, name='sigma')
+                mu = tf.layers.dense(dn1, A_DIM, tf.nn.tanh,
+                                     trainable=trainable, name='mu')
+                sigma = tf.layers.dense(dn1, A_DIM, tf.nn.softplus,
+                                        trainable=trainable, name='sigma')
                 cmd = Normal(loc=mu, scale=sigma)
         params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
         return dn1, [dn2, cmd], params
@@ -163,8 +166,8 @@ class ppo_agent():
         return dn2
 
     def connect(self, s_o, s):
-        alpha = 0.618
-        return ((1 - alpha) * s_o + s * alpha) / 2
+        alpha = 0.99
+        return (1 - alpha) * s_o + s * alpha
 
     def act(self, obs, ls):
         feed_dict = {
@@ -215,12 +218,12 @@ class ppo_agent():
         state = np.squeeze(state, axis=-1)
         img = (state * 255 + 255) / 2
         im = Image.fromarray(np.uint8(img))
-        cmd = list(cmd)
-        cmd[1] = cmd[1].astype(np.int32)
+        cmd = np.array(cmd).astype(np.int32)
         word = chr(cmd[0] + s_bh)
-        size = cmd[1]
-        loc_x = cmd[2]
-        loc_y = cmd[3]
+        cmd[1:4] = (cmd[1:4] + 1) * 25
+        size = 50 if cmd[1] > 50 else 0 if cmd[1] < 0 else cmd[1]
+        loc_x = 50 if cmd[2] > 50 else 0 if cmd[2] < 0 else cmd[2]
+        loc_y = 50 if cmd[3] > 50 else 0 if cmd[3] < 0 else cmd[3]
         dr = ImageDraw.Draw(im)
         font = ImageFont.truetype("NotoSerifCJKsc-SemiBold.otf", size)
         dr.text((loc_x, loc_y), word, font=font, fill='#000000')
@@ -256,23 +259,29 @@ class ppo_agent():
             self.sess.run(tf.global_variables_initializer())
 
     def update(self):
-        global GLOBAL_UPDATE_COUNTER
+        global GLOBAL_UPDATE_COUNTER, Replay
         while not COORD.should_stop():
             if GLOBAL_EP < EP_MAX:
                 UPDATE_EVENT.wait()  # wait until get batch of data
                 self.sess.run(self.update_oldpi_op)  # old pi to pi
-                data = [QUEUE.get() for _ in range(QUEUE.qsize())]
-                data = np.vstack(data)
-                s_o, s, a, r, ls = data[:, :S_DIM].reshape([-1, 64, 64, 1]), \
-                                   data[:, S_DIM:2*S_DIM].reshape([-1, 64, 64, 1]), \
-                                   data[:, 2*S_DIM: 2*S_DIM + 4],\
-                                   data[:, 2*S_DIM+4: 2*S_DIM+5], data[:, 2*S_DIM+5:]
-                _ = self.dtrain(s_o, s)
-                adv = self.sess.run(self.advantage, {self.ph_s: s, self.ph_dr: r})
-                [self.sess.run(self.atrain_op, {self.ph_s: s, self.ph_a: a, self.ph_adv: adv,
-                                                self.ph_ls: ls}) for _ in range(UPDATE_STEP)]
-                [self.sess.run(self.ctrain_op, {self.ph_s: s, self.ph_dr: r}) for _ in
-                 range(UPDATE_STEP)]
+                data_one = [QUEUE.get() for _ in range(QUEUE.qsize())]
+                Replay.append(data_one)
+                if len(Replay) > 16:
+                    Replay.pop(0)
+                for data in Replay:
+                    data = np.vstack(data)
+                    s_o, s, a, r, ls = data[:, :S_DIM].reshape([-1, 64, 64, 1]), \
+                                       data[:, S_DIM:2*S_DIM].reshape([-1, 64, 64, 1]), \
+                                       data[:, 2*S_DIM:2*S_DIM+4],\
+                                       data[:, 2*S_DIM+4:2*S_DIM+5], \
+                                       data[:, 2*S_DIM+5:]
+                    for _ in range(UPDATE_STEP):
+                        _ = self.dtrain(s_o, s)
+                    adv = self.sess.run(self.advantage, {self.ph_s: s, self.ph_dr: r})
+                    [self.sess.run(self.atrain_op, {self.ph_s: s, self.ph_a: a, self.ph_adv: adv,
+                                                    self.ph_ls: ls}) for _ in range(UPDATE_STEP)]
+                    [self.sess.run(self.ctrain_op, {self.ph_s: s, self.ph_dr: r}) for _ in
+                     range(UPDATE_STEP)]
                 self.save(300)
                 UPDATE_EVENT.clear()  # updating finished
                 GLOBAL_UPDATE_COUNTER = 0  # reset counter
@@ -285,21 +294,26 @@ class Worker(object):
 
     def work(self):
         global GLOBAL_EP, GLOBAL_RUNNING_R, GLOBAL_UPDATE_COUNTER, \
-            DATASET_ALL, ls
+            DATASET_ALL
         while not COORD.should_stop():
             s = Image.new('L', (width, height), 255)
             s = np.expand_dims((np.array(s)*2-255)/255, axis=-1)
             ep_r = 0
             buffer_s, buffer_a, buffer_r, buffer_ls, buffer_so = [], [], [], [],[]
-            s_o = DATASET_ALL[GLOBAL_UPDATE_COUNTER]
-            num = 64
+            s_o = DATASET_ALL[100]
+            utils.imwrite(utils.immerge(np.expand_dims(s_o, axis=0), 1, 1),'./save_img/test.jpg')
+            num = 16
+            ls = np.zeros(128)
             for t in range(num):
                 if not ROLLING_EVENT.is_set():                  # while global PPO is updating
                     ROLLING_EVENT.wait()                        # wait until PPO is updated
                     buffer_s, buffer_a, buffer_r = [], [], []   # clear history buffer
                 a, ls_ = self.ppo.act(self.ppo.connect(s_o, s), ls)
+                if math.isnan(a[1]):
+                    exit("cmd contains nan")
                 s_ = self.ppo.Draw(s, a)
-                r = self.ppo.reward(s_)
+                r = self.ppo.reward(s_) if (t == num - 1 or GLOBAL_UPDATE_COUNTER >= MIN_BATCH_SIZE) \
+                    else np.zeros(1)
                 buffer_ls.append(ls)
                 buffer_s.append(s.flatten())
                 buffer_so.append(s_o.flatten())
@@ -309,6 +323,7 @@ class Worker(object):
                 ls = ls_
                 ep_r += r
                 GLOBAL_UPDATE_COUNTER += 1                      # count to minimum batch size
+                utils.imwrite(utils.immerge(np.expand_dims(s, axis=0), 1, 1),'./save_img/test_%d.jpg'%t)
                 if t == num - 1 or GLOBAL_UPDATE_COUNTER >= MIN_BATCH_SIZE:
                     v_s_ = self.ppo.get_v(s_)
                     discounted_r = []                           # compute discounted reward
@@ -344,7 +359,6 @@ if __name__ == '__main__':
     DATASET_ALL = GLOBAL_PPO.DateSet(start, end)
     s_bh, e_bh = (0x31C0, 0x31E3)  # Unicode笔画
     DATASET_BH = GLOBAL_PPO.DateSet(s_bh, e_bh)
-    ls = np.zeros(128)
     UPDATE_EVENT, ROLLING_EVENT = threading.Event(), threading.Event()
     UPDATE_EVENT.clear()  # no update now
     ROLLING_EVENT.set()  # start to roll out
@@ -354,7 +368,7 @@ if __name__ == '__main__':
     GLOBAL_RUNNING_R = []
     COORD = tf.train.Coordinator()
     QUEUE = queue.Queue()
-    Replay_d = []
+    Replay = []
     dloss = 0
     threads = []
     for worker in workers:  # worker threads
